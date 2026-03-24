@@ -24,14 +24,11 @@ class PIDController:
         return max(min(output, self.max_out), self.min_out)
 
 # --- 2. ДОПОМІЖНІ ФУНКЦІЇ (ВЕКТОРНА ГЕОМЕТРІЯ) ---
-def get_bearing(loc1, loc2):
-    off_x = loc2.lon - loc1.lon
-    off_y = loc2.lat - loc1.lat
-    bearing = 90.00 + math.atan2(-off_y, off_x) * 57.2957795
-    if bearing < 0: bearing += 360.00
-    return bearing
-
 def get_body_frame_errors(current_loc, target_loc, heading):
+    """
+    Перетворює глобальні координати у локальні осі дрона.
+    Працює ідеально незалежно від того, куди повернутий ніс дрона!
+    """
     # Обчислення глобальних похибок (в метрах)
     d_lat = target_loc.lat - current_loc.lat
     error_north = d_lat * 1.113195e5 
@@ -49,6 +46,7 @@ def get_body_frame_errors(current_loc, target_loc, heading):
 # --- 3. ОСНОВНА ЛОГІКА ---
 def main():
     print("Підключення до SITL...")
+    # Зверніть увагу на ваш порт, якщо у вас 14551, залиште його
     vehicle = connect('127.0.0.1:14551', wait_ready=True)
 
     vehicle.parameters['SIM_WIND_SPD'] = 3
@@ -59,12 +57,12 @@ def main():
     target_loc = LocationGlobalRelative(50.443326, 30.448078, 100)
     target_alt = 100
 
+    # Залишаємо тільки 3 ПІД-регулятори (Газ, Тангаж, Крен)
     pid_alt = PIDController(kp=15.0, ki=2.0, kd=5.0, min_out=-500, max_out=500)
     pid_pitch = PIDController(kp=15.0, ki=1.0, kd=20.0, min_out=-450, max_out=450) 
     pid_roll  = PIDController(kp=15.0, ki=1.0, kd=20.0, min_out=-450, max_out=450)
-    pid_yaw = PIDController(kp=4.0, ki=0.0, kd=1.0, min_out=-250, max_out=250)
 
-    log_filename = "flight_log_full.csv"
+    log_filename = "flight_log_no_yaw.csv"
     with open(log_filename, mode='w', newline='') as log_file:
         log_writer = csv.writer(log_file)
         log_writer.writerow(['Time', 'Distance_m', 'Alt_m', 'Err_Fwd_m', 'Err_Right_m', 'PWM_Roll', 'PWM_Pitch', 'PWM_Throttle', 'PWM_Yaw'])
@@ -77,7 +75,7 @@ def main():
         vehicle.armed = True
         while not vehicle.armed: time.sleep(0.5)
 
-        print("Зліт!")
+        print("Зліт! (Режим польоту: Без зміни курсу / No Yaw)")
 
         loop_rate = 0.1 
         is_landing = False
@@ -87,11 +85,13 @@ def main():
             while True:
                 current_loc = vehicle.location.global_relative_frame
                 current_alt = current_loc.alt
+                
+                # Читаємо поточний курс, щоб знати, як ми повернуті відносно світу
                 current_heading = vehicle.heading
 
+                # Векторна магія: незалежно від курсу, отримуємо команди Вперед/Вправо
                 err_fwd, err_right = get_body_frame_errors(current_loc, target_loc, current_heading)
                 distance = math.sqrt(err_fwd**2 + err_right**2) 
-                bearing_to_target = get_bearing(current_loc, target_loc)
 
                 if distance < 3.0 and not is_landing: 
                     print("\n>>> Ціль у зоні захоплення! Вмикаю прецизійний спуск... <<<")
@@ -113,15 +113,10 @@ def main():
 
                 alt_error = target_alt - current_alt
                 
-                yaw_error = bearing_to_target - current_heading
-                if yaw_error > 180: yaw_error -= 360
-                if yaw_error < -180: yaw_error += 360
-
                 base_pwm = 1500
                 hover_pwm = 1450 
                 
                 out_throttle = hover_pwm + pid_alt.calculate(alt_error, loop_rate)
-                out_yaw = base_pwm + pid_yaw.calculate(yaw_error, loop_rate)
                 out_pitch = base_pwm - pid_pitch.calculate(err_fwd, loop_rate) 
                 out_roll = base_pwm + pid_roll.calculate(err_right, loop_rate) 
 
@@ -130,7 +125,9 @@ def main():
                 pwm_r = clamp(out_roll)
                 pwm_p = clamp(out_pitch)
                 pwm_t = clamp(out_throttle)
-                pwm_y = clamp(out_yaw)
+                
+                # ЖОРСТКА ФІКСАЦІЯ YAW: Ми більше не крутимось!
+                pwm_y = 1500
 
                 vehicle.channels.overrides = {
                     '1': pwm_r, 
@@ -139,18 +136,16 @@ def main():
                     '4': pwm_y
                 }
 
-                # Логування у файл
+                # Логування
                 elapsed_time = round(time.time() - start_time, 1)
                 log_writer.writerow([elapsed_time, round(distance, 2), round(current_alt, 2), round(err_fwd, 2), round(err_right, 2), pwm_r, pwm_p, pwm_t, pwm_y])
 
-                # ОНОВЛЕНО: Детальний і відформатований вивід у консоль кожні 0.5 секунд
                 if int(time.time() * 10) % 5 == 0: 
-                    # Використовуємо :5.1f для фіксованої ширини (5 символів всього, 1 після коми)
                     status_line = (
                         f"[{elapsed_time:5.1f}s] "
                         f"Дист: {distance:5.1f}м | Вис: {current_alt:5.1f}м | "
                         f"Пох(Вп/Пр): {err_fwd:5.1f} / {err_right:5.1f} | "
-                        f"ШІМ[R:{pwm_r} P:{pwm_p} T:{pwm_t} Y:{pwm_y}]"
+                        f"ШІМ[R:{pwm_r} P:{pwm_p} T:{pwm_t} Y:1500]"
                     )
                     print(status_line)
 
